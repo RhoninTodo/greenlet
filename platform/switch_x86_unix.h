@@ -46,27 +46,19 @@ static int
 slp_switch(void)
 {
     int err;
-#ifdef _WIN32
-    void *seh;
-#endif
     void *ebp, *ebx;
     unsigned short cw;
     register int *stackref, stsizediff;
-    __asm__ volatile ("" : : : "esi", "edi");
+    __asm__ volatile ("" : : : "esi", "edi");//内嵌汇编，输出部分，输入部分，破坏描述部分
     __asm__ volatile ("fstcw %0" : "=m" (cw));
     __asm__ volatile ("movl %%ebp, %0" : "=m" (ebp));
     __asm__ volatile ("movl %%ebx, %0" : "=m" (ebx));
-#ifdef _WIN32
-    __asm__ volatile (
-        "movl %%fs:0x0, %%eax\n"
-        "movl %%eax, %0\n"
-        : "=m" (seh)
-        :
-        : "eax");
-#endif
     __asm__ ("movl %%esp, %0" : "=g" (stackref));
     {
         SLP_SAVE_STATE(stackref, stsizediff);
+		/* 
+		 * 切换current上下文到target上下文,即%esp,%ebp
+		 */
         __asm__ volatile (
             "addl %0, %%esp\n"
             "addl %0, %%ebp\n"
@@ -74,16 +66,8 @@ slp_switch(void)
             : "r" (stsizediff)
             );
         SLP_RESTORE_STATE();
-        __asm__ volatile ("xorl %%eax, %%eax" : "=a" (err));
+        __asm__ volatile ("xorl %%eax, %%eax" : "=a" (err));//值相同异或结果=0
     }
-#ifdef _WIN32
-    __asm__ volatile (
-        "movl %0, %%eax\n"
-        "movl %%eax, %%fs:0x0\n"
-        :
-        : "m" (seh)
-        : "eax");
-#endif
     __asm__ volatile ("movl %0, %%ebx" : : "m" (ebx));
     __asm__ volatile ("movl %0, %%ebp" : : "m" (ebp));
     __asm__ volatile ("fldcw %0" : : "m" (cw));
