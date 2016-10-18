@@ -55,10 +55,10 @@ use (char*) -1, the largest possible address.
 States:
   stack_stop == NULL && stack_start == NULL:  did not start yet
   stack_stop != NULL && stack_start == NULL:  already finished
-  stack_stop != NULL && stack_start != NULL:  active
+  stack_stop != NULL && stack_start != NULL:  active(存活的、不是正在运行的)
 
 The running greenlet's stack_start is undefined but not NULL.
-
+正在执行的栈顶必然是动态的、栈底可以确定
  ***********************************************************/
 
 /*** global state ***/
@@ -153,6 +153,7 @@ static PyObject* ts_empty_dict;
 #define GREENLET_tp_is_gc 0
 #endif /* !GREENLET_USE_GC */
 
+/* 这个main greenlet就是import greenlet的那个python文件 */
 static PyGreenlet* green_create_main(void)
 {
 	PyGreenlet* gmain;
@@ -167,7 +168,7 @@ static PyGreenlet* green_create_main(void)
 	gmain = (PyGreenlet*) PyType_GenericAlloc(&PyGreenlet_Type, 0);
 	if (gmain == NULL)
 		return NULL;
-	gmain->stack_start = (char*) 1;
+	gmain->stack_start = (char*) 1;//暂时为1，切走时还要被置为 %esp
 	gmain->stack_stop = (char*) -1;
 	gmain->run_info = dict;
 	Py_INCREF(dict);
@@ -311,13 +312,23 @@ static int (*g_initialstub)(void*);
 /*
  * the following macros are spliced into the OS/compiler
  * specific code, in order to simplify maintenance.
+ *
+ * slp_save_state:保存stack到heap，设置current->stack_start = %esp
+ *
+ * 如果target不是第一次执行，它一定被切走过，一定执行过slp_save_state，
+ * stack_start也一定被设置过
+ *
+ * 如果target第一次运行，返回1，不需要执行后面的切%esp,%ebp，也不需要从heap中恢复数据
+ * 因为它还没运行，没有上下文
+ *
+ * stsizediff = target->stack_start - current->stack_start
+ * 为二者运行时esp的差值，返回用于移动%esp
  */
-
 #define SLP_SAVE_STATE(stackref, stsizediff)            \
 	stackref += STACK_MAGIC;                        \
 	if (slp_save_state((char*)stackref)) return -1; \
-	if (!PyGreenlet_ACTIVE(ts_target)) return 1;    \
-	stsizediff = ts_target->stack_start - (char*)stackref
+	if (!PyGreenlet_ACTIVE(ts_target)) return 1;    \ 
+	stsizediff = ts_target->stack_start - (char*)stackref//可能为负值
 
 #define SLP_RESTORE_STATE()                             \
 	slp_restore_state()
@@ -384,14 +395,15 @@ static int g_save(PyGreenlet* g, char* stop)
 	return 0;
 }
 
+/* 功能:恢复target greenlet中的数据，heap到stack
+ * target在c栈中数据怎么会在堆中呢?
+ * 	 如果target之前运行过，被切走了，那么它的栈数据就会被切到堆中，
+ *   新的greenlet不会走到这里，slp_save_state就返回1了
+*/
 static void GREENLET_NOINLINE(slp_restore_state)(void)
 {
 	PyGreenlet* g = ts_target;
 	PyGreenlet* owner = ts_current;
-
-#ifdef SLP_BEFORE_RESTORE_STATE
-	SLP_BEFORE_RESTORE_STATE();
-#endif
 
 	/* Restore the heap copy back into the C stack */
 	if (g->stack_saved != 0) {
@@ -402,21 +414,31 @@ static void GREENLET_NOINLINE(slp_restore_state)(void)
 	}
 	if (owner->stack_start == NULL)
 		owner = owner->stack_prev; /* greenlet is dying, skip it */
+	/* 直到链上的greenlet->stack_stop > target->stack_stop */
 	while (owner && owner->stack_stop <= g->stack_stop)
 		owner = owner->stack_prev; /* find greenlet with more stack */
 	g->stack_prev = owner;
 }
 
+/* 功能:stack中地址小于target->stack_stop的数据都切到heap中,主要针对ts_current
+ * 注意:只有把current切到heap时，才知道它的stack_start = 为当前esp指针
+ * stackref :slp_switch的栈顶指针sp 
+ * ts_target:要切换的greenlet
+ */
 static int GREENLET_NOINLINE(slp_save_state)(char* stackref)
 {
 	/* must free all the C stack up to target_stop */
-	char* target_stop = ts_target->stack_stop;
+	char* target_stop = ts_target->stack_stop;//(char*) dummymarker;
 	PyGreenlet* owner = ts_current;
 	assert(owner->stack_saved == 0);
+	
+	/* 如果current是main_greenlet,初始化时也设置为1了
+     * 如果不是main greenlet，这个greenlet也会作为target在initialstub被置1
+	 */
 	if (owner->stack_start == NULL)
 		owner = owner->stack_prev;  /* not saved if dying */
 	else
-		owner->stack_start = stackref;
+		owner->stack_start = stackref; /* 设置当前greenlet->stack_start */
 
 #ifdef SLP_BEFORE_SAVE_STATE
 	SLP_BEFORE_SAVE_STATE();
@@ -455,7 +477,9 @@ static int g_switchstack(void)
 	   are safe), because global variables are very fragile.
 	*/
 	int err;
-	{   /* save state */
+	{   /* save state
+	     * 将python当前栈帧等上下文保存至current greenlet，以后切回来时再还原
+		 */
 		PyGreenlet* current = ts_current;
 		PyThreadState* tstate = PyThreadState_GET();
 		current->recursion_depth = tstate->recursion_depth;
@@ -476,6 +500,9 @@ static int g_switchstack(void)
 		ts_target = NULL;
 	}
 	else {
+		/* 把target之前保存的python执行状态还原到PyThreadState
+		 * 如果target是第一次执行呢? target中应该没有python运行状态
+		*/
 		PyGreenlet* target = ts_target;
 		PyGreenlet* origin = ts_current;
 		PyThreadState* tstate = PyThreadState_GET();
@@ -565,9 +592,9 @@ g_switch(PyGreenlet* target, PyObject* args, PyObject* kwargs)
 			break;
 		}
 		if (!PyGreenlet_STARTED(target)) {
-			void* dummymarker;
+			void* dummymarker;//指向NULL，但是它的地址要作为target->stack_stop
 			ts_target = target;
-			err = g_initialstub(&dummymarker);
+			err = g_initialstub(&dummymarker);//这里是二级指针
 			if (err == 1) {
 				continue; /* retry the switch */
 			}
@@ -591,24 +618,10 @@ g_switch(PyGreenlet* target, PyObject* args, PyObject* kwargs)
 		Py_CLEAR(args);
 	} else {
 		PyGreenlet *origin;
-#if GREENLET_USE_TRACING
-		PyGreenlet *current;
-		PyObject *tracefunc;
-#endif
+
 		origin = ts_origin;
 		ts_origin = NULL;
-#if GREENLET_USE_TRACING
-		current = ts_current;
-		if ((tracefunc = PyDict_GetItem(current->run_info, ts_tracekey)) != NULL) {
-			Py_INCREF(tracefunc);
-			if (g_calltrace(tracefunc, args ? ts_event_switch : ts_event_throw, origin, current) < 0) {
-				/* Turn trace errors into switch throws */
-				Py_CLEAR(kwargs);
-				Py_CLEAR(args);
-			}
-			Py_DECREF(tracefunc);
-		}
-#endif
+
 		Py_DECREF(origin);
 	}
 
@@ -730,6 +743,10 @@ static int GREENLET_NOINLINE(g_initialstub)(void* mark)
 	}
 
 	/* start the greenlet */
+	
+	/* mark是dummymarker指针的地址，它一定高于切换时的%esp指针，并且低于切换到它时
+	 * 上一个greenlet的%esp指针
+	 */
 	self->stack_start = NULL;
 	self->stack_stop = (char*) mark;
 	if (ts_current->stack_start == NULL) {
@@ -760,14 +777,19 @@ static int GREENLET_NOINLINE(g_initialstub)(void* mark)
 	if (err == 1) {
 		/* in the new greenlet */
 		PyGreenlet* origin;
-#if GREENLET_USE_TRACING
-		PyObject* tracefunc;
-#endif
+
 		PyObject* result;
 		PyGreenlet* parent;
-		self->stack_start = (char*) 1;  /* running */
+		
+		/* running:这里置1, 仅代表已启动 
+		 * 这种将要运行的greenlet不需要知道它c栈真正的栈顶指针，只有当他要被切走时，
+		 * 才会在slp_save_state中将current->stack_start = %esp，因为切走时，
+		 * 需要将stack中当前%esp到target->stack_stop的数据都移到heap中
+		 */
+		self->stack_start = (char*) 1;
 
 		/* grab origin while we still can */
+		/* in g_switchstack, ts_origin = ts_current, ts_current = ts_target, ts_target = NULL */
 		origin = ts_origin;
 		ts_origin = NULL;
 
@@ -777,17 +799,6 @@ static int GREENLET_NOINLINE(g_initialstub)(void* mark)
 		Py_INCREF(self->run_info);
 		Py_XDECREF(o);
 
-#if GREENLET_USE_TRACING
-		if ((tracefunc = PyDict_GetItem(self->run_info, ts_tracekey)) != NULL) {
-			Py_INCREF(tracefunc);
-			if (g_calltrace(tracefunc, args ? ts_event_switch : ts_event_throw, origin, self) < 0) {
-				/* Turn trace errors into switch throws */
-				Py_CLEAR(kwargs);
-				Py_CLEAR(args);
-			}
-			Py_DECREF(tracefunc);
-		}
-#endif
 		Py_DECREF(origin);
 
 		if (args == NULL) {
@@ -795,6 +806,7 @@ static int GREENLET_NOINLINE(g_initialstub)(void* mark)
 			result = NULL;
 		} else {
 			/* call g.run(*args, **kwargs) */
+			/* c中调用python函数,如果函数中又switch了greenlet,不会返回 */
 			result = PyEval_CallObjectWithKeywords(
 				run, args, kwargs);
 			Py_DECREF(args);
